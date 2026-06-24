@@ -1,58 +1,74 @@
 import os
+import subprocess
 import tempfile
-import traceback
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTasks
 
 app = FastAPI(title="STL Code Runner API")
 
 
-# Схема для отправки кода текстом (альтернативный вариант)
 class CodePayload(BaseModel):
     code: str
 
 
+def remove_file(path: str):
+    """Функция обратного вызова для безопасного удаления файла после отправки"""
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+
 def run_code_and_get_stl(code_text: str) -> str:
-    """Выполняет код во временной папке и ищет созданный STL-файл"""
-    # Создаем изолированную временную директорию для работы скрипта
-    with tempfile.TemporaryDirectory() as tmpdir:
-        current_dir = os.getcwd()
-        os.chdir(tmpdir)  # Переходим туда, чтобы файлы создавались внутри
+    # Создаем временную директорию
+    tmpdir = tempfile.mkdtemp()
+    script_path = os.path.join(tmpdir, "script.py")
 
-        # Контекст для выполнения кода
-        local_context = {}
+    # Записываем код в файл
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(code_text)
 
+    try:
+        # Запускаем в отдельном процессе без изменения os.chdir()
+        # ВАЖНО: Для продакшена замените ['python'] на вызов docker-контейнера!
+        result = subprocess.run(
+            ["python", "script.py"],
+            cwd=tmpdir,
+            capture_output=True,
+            text=True,
+            timeout=30  # Защита от бесконечных циклов
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"{result.stderr}")
+
+        # Ищем STL
+        files = [f for f in os.listdir(tmpdir) if f.lower().endswith('.stl')]
+        if not files:
+            raise RuntimeError("Скрипт выполнился, но не создал .stl файл.")
+
+        # Переносим файл в надежное место перед очисткой tmpdir
+        generated_file = files[0]
+        out_path = os.path.join(tempfile.gettempdir(), f"gen_{os.urandom(4).hex()}_{generated_file}")
+
+        os.rename(os.path.join(tmpdir, generated_file), out_path)
+        return out_path
+
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Превышено время ожидания выполнения (30 сек).")
+    finally:
+        # Гарантированно чистим за собой скрипты
         try:
-            # Выполняем динамический код
-            exec(code_text, {}, local_context)
-
-            # Ищем, появился ли в папке .stl файл
-            files = [f for f in os.listdir(tmpdir) if f.lower().endswith('.stl')]
-
-            if not files:
-                raise Exception("Скрипт выполнился успешно, но не создал ни одного .stl файла.")
-
-            # Берем первый попавшийся STL-файл
-            generated_file = files[0]
-
-            # Читаем его в глобальную временную директорию ОС, чтобы отдать пользователю
-            target_path = os.path.join(tempfile.gettempdir(), f"generated_{generated_file}")
-            with open(generated_file, "rb") as f_in, open(target_path, "wb") as f_out:
-                f_out.write(f_in.read())
-
-            return target_path
-
-        except Exception as e:
-            # Перехватываем полную ошибку и трейсбек
-            error_msg = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            raise RuntimeError(error_msg)
-        finally:
-            os.chdir(current_dir)  # Возвращаем рабочую директорию назад
+            os.remove(script_path)
+            os.rmdir(tmpdir)
+        except Exception:
+            pass
 
 
 @app.post("/run-script-file/", summary="Запуск скрипта из загруженного .py файла")
-async def run_script_file(file: UploadFile = File(...)):
+async def run_script_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     if not file.filename.lower().endswith('.py'):
         raise HTTPException(status_code=400, detail="Файл должен иметь расширение .py")
 
@@ -61,31 +77,14 @@ async def run_script_file(file: UploadFile = File(...)):
 
     try:
         stl_path = run_code_and_get_stl(code_text)
-        # Отправляем файл пользователю и автоматически удаляем его после отправки
+
+        # Добавляем задачу на удаление файла ПОСЛЕ отправки клиенту
+        background_tasks.add_task(remove_file, stl_path)
+
         return FileResponse(
             path=stl_path,
             filename=os.path.basename(stl_path),
-            media_type="application/sla",
-            background=None
+            media_type="application/sla"
         )
     except RuntimeError as err:
-        raise HTTPException(status_code=400, detail=f"Ошибка выполнения скрипта:\n{str(err)}")
-
-
-# @app.post("/run-script-text/", summary="Запуск скрипта из текста (JSON)")
-# async def run_script_text(payload: CodePayload):
-#     try:
-#         stl_path = run_code_and_get_stl(payload.code)
-#         return FileResponse(
-#             path=stl_path,
-#             filename=os.path.basename(stl_path),
-#             media_type="application/sla"
-#         )
-#     except RuntimeError as err:
-#         raise HTTPException(status_code=400, detail=f"Ошибка выполнения скрипта:\n{str(err)}")
-
-
-# if __name__ == "__main__":
-#     import uvicorn
-#
-#     uvicorn.run(app, host="127.0.0.1", port=8000)
+        raise HTTPException(status_code=400, detail=f"Ошибка выполнения:\n{str(err)}")
