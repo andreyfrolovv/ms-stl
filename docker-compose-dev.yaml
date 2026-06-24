@@ -1,0 +1,15 @@
+services:
+  ms-stl:
+    build: .
+    ports:
+      - "${EXTERNAL_PORT}:8000"
+    volumes:
+      - .:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      - WATCHFILES_FORCE_POLLING=true
+      - PYTHONDONTWRITEBYTECODE=1
+    restart: always
+
+volumes:
+  model_data:
